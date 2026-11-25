@@ -1,0 +1,12 @@
+AirSIM
+
+Required Notice: Copyright 2026 AirSIM contributors. AirSIM is licensed under the PolyForm Noncommercial License 1.0.0. Commercial use requires separate written permission from the copyright holder.
+
+AirSIM names, logos, release signing keys, and official distribution channels are not licensed for use in a way that suggests an unofficial build or service is endorsed by the AirSIM project.
+
+## 第三方代码引用
+
+本仓库 push-relay-worker/src/accounts.mjs 的邀请码语义（无偏码生成、统一拒绝话术、
+同设备幂等核销、固定窗口限流）参考并改编自 OpenHanako 项目
+（https://github.com/liliMozi/openhanako，tools/alpha-gate-worker/core.mjs），
+该组件按 Apache License 2.0 授权。Copyright 适用于其原作者。

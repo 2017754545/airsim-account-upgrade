@@ -1,0 +1,43 @@
+# 用途：AirSIM iOS 未签名 IPA 云端编译。
+# 产物：AirSIM-unsigned.ipa（arm64，含 LiveActivity / NotificationService 扩展）。
+# 不做签名 / provisioning / App Store 步骤，下载后用个人证书自行侧载签名。
+name: iOS unsigned build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ios-unsigned:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build unsigned .app
+        run: |
+          xcodebuild \
+            -project clients/iOS/AirSIM.xcodeproj \
+            -scheme AirSIM \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            | tail -30
+
+      - name: Package unsigned IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          test -n "$APP" || { echo "未找到构建产物 .app"; exit 1; }
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry AirSIM-unsigned.ipa Payload
+          unzip -l AirSIM-unsigned.ipa | head -15
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirSIM-unsigned-ipa
+          path: AirSIM-unsigned.ipa
+          retention-days: 14
