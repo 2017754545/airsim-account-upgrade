@@ -75,6 +75,8 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appUpdatePresentation: AppUpdatePresentation?
+    // 账号层：未绑定账号时先展示 AirSIM Cloud 登录页（邀请码登录）。
+    @State private var accountGateVisible = !AccountCloud.isAccountApproved
     @AppStorage("airsim.selected-tab") private var selectedTabRawValue = PhoneTab.dial.rawValue
     @State private var callbackSIMRequest: CallbackSIMDialRequest?
     @State private var pendingSMSRecipient: String?
@@ -192,11 +194,18 @@ struct RootView: View {
                 .buttonStyle(.plain).padding(.horizontal)
             }
         }
+        // 账号登录 gate：盖在主界面之上，approved 后由登录页放行。
+        .overlay {
+            if accountGateVisible {
+                AccountLoginView(onEnterApp: { accountGateVisible = false })
+                    .transition(.opacity)
+            }
+        }
         .sheet(item: $model.focusedOtherDeviceCall, onDismiss: presentAppUpdateIfIdle) { reminder in
             OtherDeviceCallSheet(reminder: reminder).environmentObject(model)
         }
         .fullScreenCover(isPresented: Binding(
-            get: { !firstConnectionComplete && !appUpdates.needsNotes && appUpdatePresentation == nil && appUpdateCallIdle },
+            get: { !firstConnectionComplete && !accountGateVisible && !appUpdates.needsNotes && appUpdatePresentation == nil && appUpdateCallIdle },
             // Completion is written only by explicit actions in the onboarding view.
             // A call can temporarily dismiss this cover without completing pairing.
             set: { _ in }

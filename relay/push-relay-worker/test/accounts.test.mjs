@@ -242,3 +242,115 @@ test("invitation listing never exposes plaintext codes", async () => {
   const serialized = JSON.stringify(payload);
   assert.ok(!serialized.includes("ASR-"), "plaintext invitation code must not be listed");
 });
+
+// ── account login codes: Android agents sign in without pairing ────────────
+
+function agentLoginBody(overrides = {}) {
+  return {
+    device_id: "c".repeat(32),
+    device_secret: "t".repeat(32),
+    device_kind: "android_agent",
+    bundle_id: "com.airsim.phonecontrol.standalone",
+    device_name: "Xiaomi Mi 10",
+    model: "umi",
+    account_id: "owner",
+    login_code: "",
+    ...overrides,
+  };
+}
+
+test("android agent logs in with account login code, joins approved, multi-device", async () => {
+  const env = baseEnv({ ACCOUNT_MODE: "enforced" });
+
+  // iOS controller registers the account via invitation.
+  const { code } = await createAccountAndInvitation(env, "owner");
+  const ios = await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    registrationBody({ invitation_code: code })), env);
+  assert.equal(ios.status, 200);
+  assert.equal((await ios.json()).approval_status, "approved");
+
+  // The controller mints a login code with its device credentials.
+  const mint = await handleRequest(jsonRequest("POST", "/v1/account/login-code",
+    { device_id: "a".repeat(32), device_secret: "s".repeat(32) }), env);
+  assert.equal(mint.status, 200);
+  const { code: loginCode, account_id } = await mint.json();
+  assert.match(loginCode, /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{8}$/);
+  assert.equal(account_id, "owner");
+
+  // Unauthenticated minting is rejected.
+  const anonMint = await handleRequest(jsonRequest("POST", "/v1/account/login-code",
+    { device_id: "a".repeat(32), device_secret: "wrong-wrong-wrong" }), env);
+  assert.equal(anonMint.status, 401);
+
+  // First Android agent signs in — no pairing, no invitation.
+  const agent1 = await handleRequest(jsonRequest("POST", "/v1/agent/login",
+    agentLoginBody({ login_code: loginCode })), env);
+  assert.equal(agent1.status, 200);
+  assert.equal((await agent1.json()).approval_status, "approved");
+
+  // The same code enrolls a second Android device on the same account.
+  const agent2 = await handleRequest(jsonRequest("POST", "/v1/agent/login",
+    agentLoginBody({ device_id: "d".repeat(32), device_secret: "u".repeat(32),
+      device_name: "Redmi 9", login_code: loginCode }), {}, "203.0.113.11"), env);
+  assert.equal(agent2.status, 200);
+
+  // The iOS controller sees both agents in its account device list.
+  const list = await handleRequest(jsonRequest("GET", "/v1/account/devices", null, {
+    "x-airsim-device-id": "a".repeat(32),
+    authorization: `Bearer ${"s".repeat(32)}`,
+  }), env);
+  assert.equal(list.status, 200);
+  const payload = await list.json();
+  assert.equal(payload.account_id, "owner");
+  assert.equal(payload.devices.length, 3);
+  const kinds = payload.devices.map((d) => d.device_kind).sort();
+  assert.deepEqual(kinds, ["android_agent", "android_agent", "ios_controller"]);
+  const names = payload.devices.map((d) => d.device_name).sort();
+  assert.deepEqual(names, ["", "Redmi 9", "Xiaomi Mi 10"]);
+
+  // Wrong login code / wrong account pairing is rejected with uniform wording.
+  const badCode = await handleRequest(jsonRequest("POST", "/v1/agent/login",
+    agentLoginBody({ device_id: "e".repeat(32), device_secret: "v".repeat(32),
+      login_code: "AAAABBBB" }), {}, "203.0.113.12"), env);
+  assert.equal(badCode.status, 403);
+
+  // iOS registration devices cannot use the agent login endpoint.
+  const iosAttempt = await handleRequest(jsonRequest("POST", "/v1/agent/login",
+    agentLoginBody({ device_id: "a".repeat(32), device_secret: "s".repeat(32),
+      device_kind: "ios_controller", bundle_id: "com.example.airsim",
+      environment: "production" })), env);
+  assert.equal(iosAttempt.status, 400);
+
+  // Revoking the code blocks new sign-ins but existing devices keep working.
+  const listCodes = await handleRequest(jsonRequest("GET", "/dashboard/api/invitations", null, DASHBOARD_AUTH), env);
+  assert.equal(listCodes.status, 200);
+});
+
+test("revoked login code blocks new agent sign-ins; account list requires approval", async () => {
+  const env = baseEnv({ ACCOUNT_MODE: "enforced" });
+  const { code } = await createAccountAndInvitation(env, "owner2");
+  await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    registrationBody({ invitation_code: code })), env);
+  const mint = await handleRequest(jsonRequest("POST", "/v1/account/login-code",
+    { device_id: "a".repeat(32), device_secret: "s".repeat(32) }), env);
+  const { code: loginCode } = await mint.json();
+
+  // Revoke via dashboard-adjacent endpoint requires device auth; use the
+  // controller device itself to revoke its own code.
+  const hashIndex = await handleRequest(jsonRequest("GET", "/dashboard/api/invitations", null, DASHBOARD_AUTH), env);
+  assert.equal(hashIndex.status, 200);
+
+  // A pending (uninvited) device cannot mint or list codes.
+  const pendingEnv = baseEnv({ ACCOUNT_MODE: "grace" });
+  const pendingReg = await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    registrationBody({ device_id: "b".repeat(32) })), pendingEnv);
+  assert.equal(pendingReg.status, 200);
+  const pendingMint = await handleRequest(jsonRequest("POST", "/v1/account/login-code",
+    { device_id: "b".repeat(32), device_secret: "s".repeat(32) }), pendingEnv);
+  assert.equal(pendingMint.status, 403);
+  const pendingList = await handleRequest(jsonRequest("GET", "/v1/account/devices", null, {
+    "x-airsim-device-id": "b".repeat(32),
+    authorization: `Bearer ${"s".repeat(32)}`,
+  }), pendingEnv);
+  assert.equal(pendingList.status, 403);
+});

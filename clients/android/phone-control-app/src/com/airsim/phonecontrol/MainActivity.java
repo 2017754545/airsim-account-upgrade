@@ -366,6 +366,10 @@ public final class MainActivity extends Activity {
         root.addView(pageTitle("AirSIM Bridge", "运行中"));
 
         boolean paired = VoWLANPairingStore.configured(this);
+        // 账号层：以账号绑定为准展示主状态；未绑定时引导去登录页。
+        StandaloneAgentStore accountStore = new StandaloneAgentStore(this);
+        boolean accountBound = accountStore.configured()
+                && "approved".equals(accountStore.approvalStatus());
         LinearLayout hero = card(SURFACE_HIGH, 24);
         hero.setOrientation(LinearLayout.HORIZONTAL);
         hero.setGravity(Gravity.CENTER_VERTICAL);
@@ -376,11 +380,15 @@ public final class MainActivity extends Activity {
         hero.addView(wifi, new LinearLayout.LayoutParams(dp(58), dp(58)));
         LinearLayout heroCopy = column(dp(14));
         TextView heroTitle = label(
-                paired ? (vowlanReady() ? "VoWLAN 已就绪" : "VoWLAN 准备中") : "VoWLAN 尚未配对",
-                25, vowlanReady() ? CYAN : WARNING, Gravity.START);
+                accountBound ? "已加入账号 · 云端同步"
+                        : paired ? (vowlanReady() ? "VoWLAN 已就绪" : "VoWLAN 准备中") : "尚未绑定账号",
+                25, accountBound || vowlanReady() ? CYAN : WARNING, Gravity.START);
         heroTitle.setTypeface(Typeface.DEFAULT_BOLD);
         heroCopy.addView(heroTitle);
-        heroCopy.addView(label(vowlanNetworkLine(), 14, MUTED, Gravity.START));
+        // 账号化后主链路走 Relay 云端；局域网 IP 只在旧直连模式有意义。
+        heroCopy.addView(label(accountBound
+                ? "通话与短信经 Relay 云端通道同步，无需同一局域网"
+                : vowlanNetworkLine(), 14, MUTED, Gravity.START));
         hero.addView(heroCopy, weighted());
         hero.setClickable(true);
         hero.setOnClickListener(ignored -> showFeatureDetails(Feature.VOWLAN));
@@ -442,12 +450,8 @@ public final class MainActivity extends Activity {
 
         root.addView(modeSelector(), matchWithTop(14));
 
-        TextView pairing = primaryButton(paired ? "重新配对 iPhone" : "配对新 iPhone", BLUE);
-        pairing.setCompoundDrawablesWithIntrinsicBounds(android.R.drawable.ic_input_add, 0, 0, 0);
-        pairing.setCompoundDrawableTintList(ColorStateList.valueOf(Color.WHITE));
-        pairing.setCompoundDrawablePadding(dp(8));
-        pairing.setOnClickListener(ignored -> openPairingPage());
-        root.addView(pairing, matchWithTop(14));
+        // 账号层改造：手动 iPhone 配对入口已移除。
+        // 设备通过「账号登录」加入账号（AccountLoginActivity），云端自动同步。
 
         root.addView(sectionTitle("最近活动"), matchWithTop(22));
         LinearLayout recent = card(SURFACE, 18);

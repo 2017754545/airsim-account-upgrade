@@ -5,11 +5,7 @@ import Foundation
 /// Relay 端媒体票据有效期 10 分钟；重连或长时间通话时通过
 /// `POST /v1/calls/:uuid/media-ticket` 换取新票据。设备身份沿用
 /// Keychain 中的 device_secret（iOS 不新增本地密钥存储位置）。
-enum AccountKeys {
-    static let invitationCode = "airsim.account.invitation-code"
-    static let approvalStatus = "airsim.account.approval-status"
-}
-
+/// 账号层本地键位 AccountKeys 定义见 AccountCloud.swift。
 enum MediaTicketClient {
     struct Response: Decodable {
         let mediaToken: String

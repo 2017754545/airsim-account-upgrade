@@ -11,16 +11,22 @@ import {
 import { constantTimeEqual, sha256Hex } from "./auth-crypto.mjs";
 import { handleFeedback } from "./feedback.mjs";
 import {
+  addDeviceToAccountIndex,
   approveDevice,
+  consumeAccountLoginCode,
   consumeInvitation,
   createAccount,
+  createAccountLoginCode,
   createInvitation,
   deviceControlBlocked,
   enforceFixedWindowRateLimit,
   isDeviceRevoked,
+  listAccountDeviceIDs,
   listInvitations,
+  removeDeviceFromAccountIndex,
   revokeDevice,
   revokeInvitation,
+  revokeAccountLoginCode,
 } from "./accounts.mjs";
 import { batteryStatus } from "./battery-status.mjs";
 import { RoutingError, parseAgentID, agentSocketKey, matchesTarget, resolveTarget, requestAgentID } from "./command-routing.mjs";
@@ -170,12 +176,24 @@ async function routeRequest(request, env) {
   if (request.method === "GET" && commandConnect) {
     return connectDeviceCommands(request, env, decodeURIComponent(commandConnect[1]));
   }
+  if (request.method === "GET" && url.pathname === "/v1/account/devices") {
+    return listAccountDevices(request, env);
+  }
   if (request.method !== "POST") {
     return jsonResponse(405, { error: "method not allowed" });
   }
   try {
     if (url.pathname === "/v1/devices/register") {
       return await registerDevice(request, env);
+    }
+    if (url.pathname === "/v1/agent/login") {
+      return await agentAccountLogin(request, env);
+    }
+    if (url.pathname === "/v1/account/login-code") {
+      return await createLoginCode(request, env);
+    }
+    if (url.pathname === "/v1/account/login-code/revoke") {
+      return await revokeLoginCode(request, env);
     }
     if (url.pathname === "/v1/live-activities/register") {
       return await registerLiveActivity(request, env);
@@ -1184,10 +1202,13 @@ async function registerDevice(request, env) {
     });
   }
   const device = await readJSON(request);
-  const validationError = validateRegistration(device, env.ALLOWED_BUNDLE_ID, Boolean(env.WEBPUSH_NOTIFY) && env.APNS_AUTH_MODE !== "certificate");
+  const validationError = validateRegistration(device, env.ALLOWED_BUNDLE_ID,
+    Boolean(env.WEBPUSH_NOTIFY) && env.APNS_AUTH_MODE !== "certificate",
+    allowedAgentBundleIDs(env));
   if (validationError) return jsonResponse(400, { error: validationError });
 
-  if (env.APNS_AUTH_MODE === "certificate" && device.environment !== env.APNS_ENVIRONMENT) {
+  const isAndroidAgent = device.device_kind === "android_agent";
+  if (!isAndroidAgent && env.APNS_AUTH_MODE === "certificate" && device.environment !== env.APNS_ENVIRONMENT) {
     return jsonResponse(400, { error: "APNs environment does not match Relay configuration" });
   }
   const secretHash = await sha256Hex(device.device_secret);
@@ -1237,6 +1258,9 @@ async function registerDevice(request, env) {
     secret_hash: secretHash,
     account_id: accountID,
     approval_status: approvalStatus,
+    device_kind: isAndroidAgent ? "android_agent" : (existing?.device_kind || "ios_controller"),
+    device_name: stringValue(device.device_name || existing?.device_name).slice(0, 120),
+    agent_model: stringValue(device.model || existing?.agent_model).slice(0, 120),
     voip_token: (device.voip_token || "").toLowerCase(),
     alert_token: (device.alert_token || "").toLowerCase(),
     watch_voip_token: (device.watch_voip_token || "").toLowerCase(),
@@ -1261,6 +1285,14 @@ async function registerDevice(request, env) {
   };
   record.media_transport = assignedMediaTransport(record, env);
   await writeDeviceRecord(env, record.device_id, record);
+  // Keep the per-account device index in sync so /v1/account/devices can
+  // enumerate the account without a full KV scan.
+  if (record.account_id) {
+    if (existing?.account_id && existing.account_id !== record.account_id) {
+      await removeDeviceFromAccountIndex(env, existing.account_id, record.device_id);
+    }
+    await addDeviceToAccountIndex(env, record.account_id, record.device_id);
+  }
   await recordDashboardEvent(env, {
     type: "registration", device_id: record.device_id, status: "delivered",
     channel: "relay", environment: record.environment,
@@ -1273,6 +1305,165 @@ async function registerDevice(request, env) {
     approval_status: record.approval_status,
     account_bound: Boolean(record.account_id),
   });
+}
+
+// ── account login (Android agents, no pairing) ─────────────────────────────
+// Android devices never register on their own: the iOS controller owns the
+// account, mints a login code, and each Android agent signs in with
+// account_id + login code. The device joins pre-approved so account syncing
+// is automatic; multi-device accounts simply reuse the same login code.
+
+async function agentAccountLogin(request, env) {
+  const loginLimit = await enforceFixedWindowRateLimit(
+    env, `login:${clientIP(request)}`, 30, 60 * 60);
+  if (!loginLimit.allowed) {
+    return jsonResponse(429, {
+      error: "too many login attempts; try again later",
+      retry_after_seconds: loginLimit.retry_after_seconds,
+    });
+  }
+  const device = await readJSON(request);
+  const validationError = validateRegistration(device, env.ALLOWED_BUNDLE_ID, false,
+    allowedAgentBundleIDs(env));
+  if (validationError) return jsonResponse(400, { error: validationError });
+  if (device.device_kind !== "android_agent") {
+    return jsonResponse(400, { error: "login endpoint is for android agents only" });
+  }
+  if (!nonEmpty(device.account_id) || device.account_id.length > 64) {
+    return jsonResponse(400, { error: "account_id is required" });
+  }
+
+  const secretHash = await sha256Hex(device.device_secret);
+  const existing = await readDeviceRecord(env, device.device_id.trim());
+  if (existing && !constantTimeEqual(existing.secret_hash, secretHash)) {
+    return jsonResponse(401, { error: "device authentication failed" });
+  }
+  if (await isDeviceRevoked(env, device.device_id.trim())) {
+    return jsonResponse(403, { error: "device is revoked" });
+  }
+  if (existing?.account_id && device.account_id !== existing.account_id) {
+    return jsonResponse(403, { error: "device already belongs to another account" });
+  }
+
+  const consumed = await consumeAccountLoginCode(env, device.login_code, device.device_id.trim());
+  if (consumed.error) return jsonResponse(403, { error: consumed.error });
+  if (consumed.account_id !== device.account_id.trim()) {
+    await recordDashboardEvent(env, {
+      type: "audit", scope: "login", action: "account_mismatch",
+      device_id: device.device_id.trim(), account_id: device.account_id.trim(),
+      status: "rejected", channel: "relay",
+    });
+    return jsonResponse(403, { error: "account or login code is invalid or no longer usable" });
+  }
+
+  const record = {
+    device_id: device.device_id.trim(),
+    secret_hash: secretHash,
+    account_id: consumed.account_id,
+    approval_status: "approved",
+    device_kind: "android_agent",
+    device_name: stringValue(device.device_name).slice(0, 120),
+    agent_model: stringValue(device.model).slice(0, 120),
+    voip_token: "",
+    alert_token: "",
+    watch_voip_token: "",
+    watch_bundle_id: "",
+    live_activity_push_to_start_token: "",
+    live_activity_presentation: existing?.live_activity_presentation || "call",
+    bundle_id: device.bundle_id,
+    environment: "",
+    registered_at: existing?.registered_at || new Date().toISOString(),
+    media_transport_requested: MEDIA_TRANSPORTS.has(device.media_transport)
+      ? device.media_transport : "legacy_pcm",
+    app_media_capabilities: normalizedMediaCapabilities(
+      device.app_media_capabilities ?? existing?.app_media_capabilities),
+    agent_media_capabilities: normalizedMediaCapabilities(
+      device.agent_media_capabilities ?? existing?.agent_media_capabilities),
+    force_legacy_pcm: device.force_legacy_pcm === true,
+  };
+  record.media_transport = assignedMediaTransport(record, env);
+  await writeDeviceRecord(env, record.device_id, record);
+  if (existing?.account_id && existing.account_id !== record.account_id) {
+    await removeDeviceFromAccountIndex(env, existing.account_id, record.device_id);
+  }
+  await addDeviceToAccountIndex(env, record.account_id, record.device_id);
+  await recordDashboardEvent(env, {
+    type: "login", device_id: record.device_id, status: "delivered",
+    channel: "relay", account_id: record.account_id,
+  });
+  return jsonResponse(200, {
+    registered: true,
+    approval_status: record.approval_status,
+    account_id: record.account_id,
+  });
+}
+
+// iOS controller mints a login code for its account. Approved devices only.
+async function createLoginCode(request, env) {
+  const value = await readJSON(request);
+  const authenticated = await authenticate(value, env);
+  if (authenticated.response) return authenticated.response;
+  const controlDenied = requireControlAccess(authenticated);
+  if (controlDenied) return controlDenied;
+  const device = authenticated.device;
+  if (!device.account_id) {
+    return jsonResponse(409, { error: "device is not bound to an account; register with an invitation first" });
+  }
+  const result = await createAccountLoginCode(env, device.account_id,
+    { purpose: "android agent via iOS" });
+  if (result.error) return jsonResponse(400, { error: result.error });
+  return jsonResponse(200, {
+    code: result.code,
+    account_id: result.account_id,
+    expires_at: result.expires_at,
+  });
+}
+
+// Revoke a login code by hash. The iOS client lists codes it minted.
+async function revokeLoginCode(request, env) {
+  const value = await readJSON(request);
+  const authenticated = await authenticate(value, env);
+  if (authenticated.response) return authenticated.response;
+  const controlDenied = requireControlAccess(authenticated);
+  if (controlDenied) return controlDenied;
+  const device = authenticated.device;
+  if (!device.account_id) return jsonResponse(409, { error: "device is not bound to an account" });
+  const result = await revokeAccountLoginCode(env, device.account_id, value.code_hash);
+  if (result.error) return jsonResponse(400, { error: result.error });
+  return jsonResponse(200, { revoked: true });
+}
+
+// Enumerate every device bound to the caller's account. GET with
+// x-airsim-device-id + Bearer device secret; approved devices only.
+async function listAccountDevices(request, env) {
+  const deviceID = request.headers.get("x-airsim-device-id") || "";
+  const authorization = request.headers.get("authorization") || "";
+  const secret = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  const authenticated = await authenticate({ device_id: deviceID, device_secret: secret }, env);
+  if (authenticated.response) return authenticated.response;
+  const controlDenied = requireControlAccess(authenticated);
+  if (controlDenied) return controlDenied;
+  const device = authenticated.device;
+  if (!device.account_id) {
+    return jsonResponse(200, { account_id: null, devices: [] });
+  }
+  const ids = await listAccountDeviceIDs(env, device.account_id);
+  const devices = [];
+  for (const id of ids) {
+    const record = await readDeviceRecord(env, id);
+    if (!record || record.approval_status === "revoked") continue;
+    devices.push({
+      device_id: record.device_id,
+      device_kind: record.device_kind || "ios_controller",
+      device_name: record.device_name || "",
+      model: record.agent_model || "",
+      approval_status: record.approval_status,
+      bundle_id: record.bundle_id || "",
+      media_transport: record.media_transport || "",
+      registered_at: record.registered_at || "",
+    });
+  }
+  return jsonResponse(200, { account_id: device.account_id, devices });
 }
 
 async function registerLiveActivity(request, env) {
@@ -2238,7 +2429,16 @@ export async function sendAPNs(env, device, token, options) {
   }
 }
 
-export function validateRegistration(device, allowedBundleID, webPushEnabled = false) {
+const DEFAULT_AGENT_BUNDLE_IDS = ["com.airsim.phonecontrol.standalone", "com.airsim.phonecontrol"];
+
+function allowedAgentBundleIDs(env) {
+  const configured = String(env.ALLOWED_AGENT_BUNDLE_IDS || "")
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  return [...new Set([...DEFAULT_AGENT_BUNDLE_IDS, ...configured])];
+}
+
+export function validateRegistration(device, allowedBundleID, webPushEnabled = false,
+    agentBundleIDs = DEFAULT_AGENT_BUNDLE_IDS) {
   if (!nonEmpty(device.device_id) || device.device_id.trim().length > 128 ||
       typeof device.device_secret !== "string" || device.device_secret.length < 16 ||
       device.device_secret.length > 512) return "invalid device identity";
@@ -2246,6 +2446,13 @@ export function validateRegistration(device, allowedBundleID, webPushEnabled = f
   const alert = device.alert_token || "";
   const watchVoIP = device.watch_voip_token || "";
   const liveActivity = device.live_activity_push_to_start_token || "";
+  // Android agents sign in through /v1/agent/login with account credentials;
+  // they carry no APNs identity of their own and poll the command channel.
+  const isAndroidAgent = device.device_kind === "android_agent";
+  if (isAndroidAgent) {
+    if (!agentBundleIDs.includes(device.bundle_id)) return "bundle id is not allowed";
+    return "";
+  }
   if (!webPushEnabled && !voip && !alert && !watchVoIP && !liveActivity) return "at least one APNs token is required";
   if ((voip && !TOKEN_PATTERN.test(voip)) || (alert && !TOKEN_PATTERN.test(alert)) ||
       (watchVoIP && !TOKEN_PATTERN.test(watchVoIP)) ||

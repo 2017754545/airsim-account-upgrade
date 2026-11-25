@@ -12,6 +12,9 @@
 //   account:{account_id}      -> account record
 //   invite:{code_hash}        -> invitation record (the code itself is never stored)
 //   invite-index              -> { hashes: [code_hash, ...] }
+//   login-code:{code_hash}    -> account login code (Android agents sign in with
+//                                account_id + login code; reusable across devices)
+//   login-index:{account_id}  -> { hashes: [code_hash, ...] }
 //   revoked-device:{id}       -> tombstone with long TTL
 //   ratelimit:{bucket}        -> { count, resetAt } fixed-window counter
 
@@ -40,6 +43,22 @@ const RATELIMIT_PREFIX = "ratelimit:";
 const DEFAULT_INVITE_TTL_HOURS = 24;
 const MAX_INVITES_PER_ACCOUNT = 200;
 const ACCOUNT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,63}$/i;
+
+// Account login codes let Android agents join an already-registered account
+// without any pairing step. They are account-scoped (not device-scoped),
+// reusable by multiple Android devices, and revocable from the iOS client.
+const LOGIN_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const LOGIN_CODE_LENGTH = 8;
+const LOGIN_CODE_PATTERN = new RegExp(
+  `^[${LOGIN_CODE_ALPHABET}]{${LOGIN_CODE_LENGTH}}$`,
+);
+const LOGIN_CODE_PREFIX = "login-code:";
+const LOGIN_INDEX_PREFIX = "login-index:";
+const LOGIN_CODE_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days, revocable any time
+const MAX_LOGIN_CODES_PER_ACCOUNT = 20;
+
+// Same oracle-defence wording as invitations: one message for every failure.
+const INVALID_LOGIN_MESSAGE = "account or login code is invalid or no longer usable";
 
 // One wording for "not a code", "already spent", "revoked" and "expired".
 // Splitting these apart would turn registration into a code oracle.
@@ -312,4 +331,177 @@ export function deviceControlBlocked(device) {
   if (device.approval_status === "revoked") return "device revoked";
   if (device.approval_status === "pending") return "device pending approval";
   return "";
+}
+
+// ── account login codes (Android agent sign-in) ────────────────────────────
+// The iOS controller registers an account via invitation; the account owner
+// then mints a login code so any number of Android agents can join that same
+// account with no pairing. Codes are hashed at rest, reusable across devices,
+// expire after 90 days and are revocable from the iOS client or dashboard.
+
+function generateLoginCode(randomBytes = defaultRandomBytes) {
+  const bytes = randomBytes(LOGIN_CODE_LENGTH);
+  const glyphs = [];
+  for (const byte of bytes) glyphs.push(LOGIN_CODE_ALPHABET[byte % 32]);
+  return glyphs.join("");
+}
+
+/** Mints a new login code for the account. Plaintext is returned exactly once. */
+export async function createAccountLoginCode(env, accountID, { purpose } = {}) {
+  const id = String(accountID || "").trim();
+  if (!isValidAccountID(id)) return { error: "invalid account id" };
+  const account = await readAccount(env, id);
+  if (!account || account.status !== "active") return { error: "account not found" };
+  const index = await readLoginIndex(env, id);
+  if (index.hashes.length >= MAX_LOGIN_CODES_PER_ACCOUNT) {
+    return { error: "too many active login codes; revoke one first" };
+  }
+  const code = generateLoginCode();
+  const codeHash = await sha256Hex(code);
+  const record = {
+    code_hash: codeHash,
+    account_id: id,
+    purpose: String(purpose || "android agent").slice(0, 120),
+    created_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + LOGIN_CODE_TTL_SECONDS * 1_000).toISOString(),
+    status: "active",
+    used_by: [],
+  };
+  await writeRelayState(env, `${LOGIN_CODE_PREFIX}${codeHash}`, JSON.stringify(record),
+    LOGIN_CODE_TTL_SECONDS);
+  index.hashes.push(codeHash);
+  await writeRelayState(env, `${LOGIN_INDEX_PREFIX}${id}`, JSON.stringify(index), null);
+  await recordDashboardEvent(env, {
+    type: "audit", scope: "login-code", action: "created",
+    account_id: id, login_code: codeHash.slice(0, 12),
+    status: "delivered", channel: "relay",
+  });
+  return { code, code_hash: codeHash, expires_at: record.expires_at, account_id: id };
+}
+
+async function readLoginIndex(env, accountID) {
+  const raw = await readRelayState(env, `${LOGIN_INDEX_PREFIX}${String(accountID || "").trim()}`);
+  let index = { hashes: [] };
+  if (raw) { try { index = JSON.parse(raw); } catch { /* rebuild below */ } }
+  if (!Array.isArray(index.hashes)) index.hashes = [];
+  return index;
+}
+
+export async function listAccountLoginCodes(env, accountID) {
+  const id = String(accountID || "").trim();
+  if (!isValidAccountID(id)) return [];
+  const index = await readLoginIndex(env, id);
+  const now = Date.now();
+  const codes = [];
+  for (const hash of index.hashes) {
+    const raw = await readRelayState(env, `${LOGIN_CODE_PREFIX}${hash}`);
+    if (!raw) continue;
+    let record;
+    try { record = JSON.parse(raw); } catch { continue; }
+    codes.push({
+      code_hash: record.code_hash,
+      purpose: record.purpose,
+      created_at: record.created_at,
+      expires_at: record.expires_at,
+      status: record.status,
+      used_by: Array.isArray(record.used_by) ? record.used_by.length : 0,
+    });
+  }
+  return codes;
+}
+
+export async function revokeAccountLoginCode(env, accountID, codeHash) {
+  const id = String(accountID || "").trim();
+  const hash = String(codeHash || "").trim().toLowerCase();
+  if (!isValidAccountID(id) || !/^[0-9a-f]{64}$/.test(hash)) {
+    return { error: "invalid login code" };
+  }
+  const raw = await readRelayState(env, `${LOGIN_CODE_PREFIX}${hash}`);
+  if (!raw) return { error: "login code not found" };
+  let record;
+  try { record = JSON.parse(raw); } catch { return { error: "login code not found" }; }
+  if (record.account_id !== id) return { error: "login code not found" };
+  record.status = "revoked";
+  await writeRelayState(env, `${LOGIN_CODE_PREFIX}${hash}`, JSON.stringify(record),
+    LOGIN_CODE_TTL_SECONDS);
+  await recordDashboardEvent(env, {
+    type: "audit", scope: "login-code", action: "revoked",
+    account_id: id, login_code: hash.slice(0, 12),
+    status: "delivered", channel: "relay",
+  });
+  return { revoked: true };
+}
+
+/**
+ * Validates an account login code presented by an Android agent. Unlike
+ * invitations, codes stay usable across many devices (each Android device
+ * signs in with the same account code) and never transition to "used".
+ */
+export async function consumeAccountLoginCode(env, code, deviceID) {
+  const supplied = String(code || "").trim().toUpperCase();
+  if (!LOGIN_CODE_PATTERN.test(supplied)) return { error: INVALID_LOGIN_MESSAGE };
+  const hash = await sha256Hex(supplied);
+  const raw = await readRelayState(env, `${LOGIN_CODE_PREFIX}${hash}`);
+  if (!raw) return { error: INVALID_LOGIN_MESSAGE };
+  let record;
+  try { record = JSON.parse(raw); } catch { return { error: INVALID_LOGIN_MESSAGE }; }
+  const expired = record.expires_at && Date.parse(record.expires_at) <= Date.now();
+  if (record.status !== "active" || expired) {
+    await auditRegistration(env, "login_code_unusable", deviceID, record.account_id);
+    return { error: INVALID_LOGIN_MESSAGE };
+  }
+  const account = await readAccount(env, record.account_id);
+  if (!account || account.status !== "active") {
+    await auditRegistration(env, "login_code_account_missing", deviceID, record.account_id);
+    return { error: INVALID_LOGIN_MESSAGE };
+  }
+  // Track which devices have signed in with this code (bounded list, audit only).
+  if (Array.isArray(record.used_by) && deviceID && !record.used_by.includes(deviceID)) {
+    record.used_by = record.used_by.slice(-49);
+    record.used_by.push(deviceID);
+    await writeRelayState(env, `${LOGIN_CODE_PREFIX}${hash}`, JSON.stringify(record),
+      LOGIN_CODE_TTL_SECONDS);
+  }
+  return { account_id: record.account_id };
+}
+
+// ── account device index ───────────────────────────────────────────────────
+// Lets an approved client list every device bound to its account. The index
+// mirrors device.account_id; the authoritative state remains the device record.
+
+const ACCOUNT_DEVICES_PREFIX = "account-devices:";
+
+async function readAccountDeviceIndex(env, accountID) {
+  const raw = await readRelayState(env, `${ACCOUNT_DEVICES_PREFIX}${String(accountID || "").trim()}`);
+  let index = { devices: [] };
+  if (raw) { try { index = JSON.parse(raw); } catch { /* rebuild below */ } }
+  if (!Array.isArray(index.devices)) index.devices = [];
+  return index;
+}
+
+export async function addDeviceToAccountIndex(env, accountID, deviceID) {
+  const id = String(accountID || "").trim();
+  if (!isValidAccountID(id) || !deviceID) return;
+  const index = await readAccountDeviceIndex(env, id);
+  if (!index.devices.includes(deviceID)) {
+    index.devices.push(deviceID);
+    await writeRelayState(env, `${ACCOUNT_DEVICES_PREFIX}${id}`,
+      JSON.stringify(index), null);
+  }
+}
+
+export async function removeDeviceFromAccountIndex(env, accountID, deviceID) {
+  const id = String(accountID || "").trim();
+  if (!isValidAccountID(id) || !deviceID) return;
+  const index = await readAccountDeviceIndex(env, id);
+  if (index.devices.includes(deviceID)) {
+    index.devices = index.devices.filter((value) => value !== deviceID);
+    await writeRelayState(env, `${ACCOUNT_DEVICES_PREFIX}${id}`,
+      JSON.stringify(index), null);
+  }
+}
+
+export async function listAccountDeviceIDs(env, accountID) {
+  const index = await readAccountDeviceIndex(env, accountID);
+  return index.devices;
 }

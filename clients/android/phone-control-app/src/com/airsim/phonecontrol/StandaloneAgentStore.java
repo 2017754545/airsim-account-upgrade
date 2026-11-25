@@ -211,18 +211,27 @@ final class StandaloneAgentStore {
         String deviceID = value.optString("device_id", "").trim();
         String secret = value.optString("device_secret", "");
         String bundleID = value.optString("bundle_id", "").trim();
-        String environment = value.optString("environment", "");
         String relayURL = value.optString("relay_url", "").trim();
         if (deviceID.isEmpty() || deviceID.length() > 128) throw new IllegalArgumentException("device_id 无效");
         if (secret.length() < 16 || secret.length() > 512) throw new IllegalArgumentException("device_secret 无效");
         if (bundleID.isEmpty() || bundleID.length() > 255) throw new IllegalArgumentException("bundle_id 无效");
-        if (!"sandbox".equals(environment) && !"production".equals(environment)) {
-            throw new IllegalArgumentException("environment 必须是 sandbox 或 production");
-        }
         URI relay = URI.create(relayURL);
         if (!"https".equalsIgnoreCase(relay.getScheme()) || relay.getHost() == null
                 || relay.getRawUserInfo() != null) {
             throw new IllegalArgumentException("relay_url 必须是无凭据的 HTTPS 地址");
+        }
+        // 账号登录设备（android_agent）没有 APNs 身份：云端命令/媒体走主动轮询，
+        // 注册与审批状态由 /v1/agent/login 建立，无需 voip/alert token。
+        if ("android_agent".equals(value.optString("device_kind", ""))) {
+            JSONArray capabilities = value.optJSONArray("agent_media_capabilities");
+            if (capabilities == null) {
+                value.put("agent_media_capabilities", new JSONArray().put("legacy_pcm"));
+            }
+            return;
+        }
+        String environment = value.optString("environment", "");
+        if (!"sandbox".equals(environment) && !"production".equals(environment)) {
+            throw new IllegalArgumentException("environment 必须是 sandbox 或 production");
         }
         boolean hasToken = false;
         for (String key : new String[]{"voip_token", "alert_token", "watch_voip_token",
