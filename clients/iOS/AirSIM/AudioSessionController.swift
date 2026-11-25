@@ -21,12 +21,9 @@ enum CallAudioGraph {
         }
         // The native tap preserves the I/O format. Never reapply a stale format
         // after VoiceProcessingIO replaces/configures its buses.
-        if #available(iOS 27.0, *) {
-            try input.__installTap(onBus: 0, bufferSize: AVAudioFrameCount(max(1024, rate * 0.1)),
-                                   format: nil, error: (), block: block)
-        } else {
-            input.installTap(onBus: 0, bufferSize: 1024, format: nil, block: block)
-        }
+        // 注：原 iOS 27 分支依赖私有 __installTap，新 SDK 已移除；
+        // 公共 installTap(format: nil) 行为一致（保留 I/O 原生格式）。
+        input.installTap(onBus: 0, bufferSize: 1024, format: nil, block: block)
     }
 }
 
