@@ -1,0 +1,10 @@
+name: push diag
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/push-diag.yml"]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "push-triggered run OK"
