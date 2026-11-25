@@ -186,7 +186,7 @@ private struct DeviceDetailSheet: View {
                     infoRow("类型", device.kindLabel)
                     infoRow("型号", device.model.isEmpty ? "—" : device.model)
                     infoRow("审批状态", device.approvalStatus)
-                    infoRow("注册时间", device.registeredAt.isEmpty ? "—" : device.registeredAt.replacingOccurrences(of: "T", with: " ").prefix(16))
+                    infoRow("注册时间", device.registeredAt.isEmpty ? "—" : String(device.registeredAt.replacingOccurrences(of: "T", with: " ").prefix(16)))
                     infoRow("连接", device.approvalStatus == "approved" ? "云端在线" : "离线")
                 }
                 .padding(16)

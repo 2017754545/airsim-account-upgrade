@@ -379,10 +379,10 @@ struct RootView: View {
                 model.bindAndroidAgent(id)
             }
             switch target.destination {
-            case .status: selectedTab = .settings
+            case .status: selectedTab = .account
             case .dial: selectedTab = .dial
             case .messages: selectedTab = .messages
-            case .contacts: selectedTab = .contacts
+            case .contacts: selectedTab = .devices
             case .recents: selectedTab = .recents
             }
             return
