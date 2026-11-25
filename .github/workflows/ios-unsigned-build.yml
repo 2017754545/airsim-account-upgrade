@@ -20,6 +20,7 @@ jobs:
 
       - name: Build unsigned .app
         run: |
+          set -o pipefail
           xcodebuild \
             -project clients/iOS/AirSIM.xcodeproj \
             -scheme AirSIM \
@@ -30,12 +31,16 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             ARCHS=arm64 \
-            | tail -30
+            | tail -60
 
       - name: Package unsigned IPA
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           test -n "$APP" || { echo "未找到构建产物 .app"; exit 1; }
+          test -f "$APP/Info.plist" || { echo ".app 缺少 Info.plist，构建不完整"; exit 1; }
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" 2>/dev/null || echo "")
+          test -n "$EXE" && test -f "$APP/$EXE" || { echo ".app 缺少主可执行文件 $EXE，构建不完整"; exit 1; }
+          rm -rf Payload AirSIM-unsigned.ipa
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry AirSIM-unsigned.ipa Payload
