@@ -139,6 +139,74 @@ export async function createAccount(env, accountID) {
   return { account };
 }
 
+// ── Account password (PBKDF2-SHA256) ────────────────────────────────────────
+// 注册时由用户自设：iOS 持服务器签发的一次性邀请码换取建号资格，账号 ID 与
+// 密码在注册请求里提交。密码只存哈希，安卓被控端用 账号 ID + 密码 登录。
+
+const PBKDF2_ITERATIONS = 100_000;
+const MIN_PASSWORD_LENGTH = 8;
+const MAX_PASSWORD_LENGTH = 128;
+
+function passwordPolicyError(password) {
+  if (typeof password !== "string" || password.length < MIN_PASSWORD_LENGTH ||
+      password.length > MAX_PASSWORD_LENGTH) {
+    return `password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters`;
+  }
+  return "";
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITERATIONS },
+    keyMaterial, 256);
+  const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${b64(salt)}$${b64(bits)}`;
+}
+
+function constantTimeEqualStrings(a, b) {
+  const ab = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < Math.max(ab.length, bb.length); i++) {
+    diff |= (ab[i] || 0) ^ (bb[i] || 0);
+  }
+  return diff === 0;
+}
+
+export async function createAccountWithPassword(env, accountID, password) {
+  const policy = passwordPolicyError(password);
+  if (policy) return { error: policy };
+  const created = await createAccount(env, accountID);
+  if (created.error) return created;
+  const account = {
+    ...created.account,
+    password_hash: await hashPassword(password),
+  };
+  await writeRelayState(env, `${ACCOUNT_PREFIX}${account.account_id}`,
+    JSON.stringify(account), null);
+  return { account };
+}
+
+export async function verifyAccountPassword(env, accountID, password) {
+  const account = await readAccount(env, accountID);
+  if (!account?.password_hash) return false;
+  const parts = String(account.password_hash).split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+  const iterations = Number(parts[1]);
+  const salt = Uint8Array.from(atob(parts[2]), (c) => c.charCodeAt(0));
+  const expected = parts[3];
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(String(password || "")), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+    keyMaterial, 256);
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(bits)));
+  return constantTimeEqualStrings(b64, expected);
+}
+
 export async function readAccount(env, accountID) {
   const raw = await readRelayState(env, `${ACCOUNT_PREFIX}${String(accountID || "").trim()}`);
   if (!raw) return null;
@@ -146,10 +214,16 @@ export async function readAccount(env, accountID) {
 }
 
 export async function createInvitation(env, { accountID, ttlHours, purpose }) {
-  const id = String(accountID || "").trim();
-  if (!isValidAccountID(id)) return { error: "invalid account id" };
-  const account = await readAccount(env, id);
-  if (!account || account.status !== "active") return { error: "account not found" };
+  const rawID = String(accountID || "").trim();
+  // Open invitation: no pre-bound account. The redeemer creates the account
+  // (account_id + password chosen on the device) as part of registration.
+  let id = null;
+  if (rawID) {
+    if (!isValidAccountID(rawID)) return { error: "invalid account id" };
+    const account = await readAccount(env, rawID);
+    if (!account || account.status !== "active") return { error: "account not found" };
+    id = rawID;
+  }
   const hours = Number(ttlHours);
   const ttl = Number.isFinite(hours) && hours > 0 && hours <= 24 * 30
     ? hours : DEFAULT_INVITE_TTL_HOURS;
@@ -252,6 +326,21 @@ export async function consumeInvitation(env, code, deviceID) {
   if (alreadyUsed || expired) {
     await auditRegistration(env, "invitation_unusable", deviceID, record.account_id);
     return { error: INVALID_INVITE_MESSAGE };
+  }
+  // Open invitation: no pre-bound account — the caller creates the account
+  // (account_id + password) during registration. Mark it used immediately;
+  // if account creation fails the code is lost, which is the safe direction.
+  if (!record.account_id) {
+    record.status = "used";
+    record.used_by = deviceID;
+    record.used_at = new Date().toISOString();
+    await writeRelayState(env, `${INVITE_PREFIX}${hash}`, JSON.stringify(record), null);
+    await recordDashboardEvent(env, {
+      type: "audit", scope: "invitation", action: "consumed_open",
+      device_id: deviceID, invitation: hash.slice(0, 12),
+      status: "delivered", channel: "relay",
+    });
+    return { account_id: null, purpose: record.purpose, open: true };
   }
   const account = await readAccount(env, record.account_id);
   if (!account || account.status !== "active") {

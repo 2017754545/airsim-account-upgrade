@@ -17,6 +17,7 @@ import {
   consumeInvitation,
   createAccount,
   createAccountLoginCode,
+  createAccountWithPassword,
   createInvitation,
   deviceControlBlocked,
   enforceFixedWindowRateLimit,
@@ -24,6 +25,7 @@ import {
   listAccountDeviceIDs,
   listInvitations,
   removeDeviceFromAccountIndex,
+  verifyAccountPassword,
   revokeDevice,
   revokeInvitation,
   revokeAccountLoginCode,
@@ -1236,7 +1238,34 @@ async function registerDevice(request, env) {
     approvalStatus = existing.approval_status === "approved" ? "approved" : "pending";
   } else {
     const invitationCode = typeof device.invitation_code === "string" ? device.invitation_code : "";
-    if (invitationCode) {
+    // Self-service account creation: iOS 控制端输入服务器签发的开放邀请码后，
+    // 自设账号 ID 与密码建号并绑定。安卓被控端永远只能登录已有账号。
+    if (device.create_account === true) {
+      if (isAndroidAgent) {
+        return jsonResponse(400, { error: "android devices cannot create accounts" });
+      }
+      if (env.ACCOUNT_SELF_REGISTER === "0") {
+        return jsonResponse(403, { error: "self-service account registration is disabled" });
+      }
+      if (!invitationCode) {
+        return jsonResponse(400, { error: "an invitation code is required to create an account" });
+      }
+      if (!nonEmpty(device.account_id) || device.account_id.trim().length > 64) {
+        return jsonResponse(400, { error: "account_id is required" });
+      }
+      const consumed = await consumeInvitation(env, invitationCode, device.device_id.trim());
+      if (consumed.error) return jsonResponse(403, { error: consumed.error });
+      if (!consumed.open) {
+        return jsonResponse(403, { error: "this invitation is bound to an existing account; use it on the sign-in form instead" });
+      }
+      const created = await createAccountWithPassword(env, device.account_id, device.account_password);
+      if (created.error === "account already exists") {
+        return jsonResponse(409, { error: "account already exists; sign in instead or pick another account id" });
+      }
+      if (created.error) return jsonResponse(400, { error: created.error });
+      accountID = created.account.account_id;
+      approvalStatus = "approved";
+    } else if (invitationCode) {
       const consumed = await consumeInvitation(env, invitationCode, device.device_id.trim());
       if (consumed.error) return jsonResponse(403, { error: consumed.error });
       accountID = consumed.account_id;
@@ -1345,21 +1374,40 @@ async function agentAccountLogin(request, env) {
     return jsonResponse(403, { error: "device already belongs to another account" });
   }
 
-  const consumed = await consumeAccountLoginCode(env, device.login_code, device.device_id.trim());
-  if (consumed.error) return jsonResponse(403, { error: consumed.error });
-  if (consumed.account_id !== device.account_id.trim()) {
-    await recordDashboardEvent(env, {
-      type: "audit", scope: "login", action: "account_mismatch",
-      device_id: device.device_id.trim(), account_id: device.account_id.trim(),
-      status: "rejected", channel: "relay",
-    });
-    return jsonResponse(403, { error: "account or login code is invalid or no longer usable" });
+  // 两种登录凭据：账号密码（主路径）或旧版登录码（兼容已下发的码）。
+  let boundAccountID;
+  if (nonEmpty(device.account_password)) {
+    const passwordOK = await verifyAccountPassword(
+      env, device.account_id.trim(), device.account_password);
+    if (!passwordOK) {
+      await recordDashboardEvent(env, {
+        type: "audit", scope: "login", action: "password_mismatch",
+        device_id: device.device_id.trim(), account_id: device.account_id.trim(),
+        status: "rejected", channel: "relay",
+      });
+      return jsonResponse(403, { error: "account or password is incorrect" });
+    }
+    boundAccountID = device.account_id.trim();
+  } else if (nonEmpty(device.login_code)) {
+    const consumed = await consumeAccountLoginCode(env, device.login_code, device.device_id.trim());
+    if (consumed.error) return jsonResponse(403, { error: consumed.error });
+    if (consumed.account_id !== device.account_id.trim()) {
+      await recordDashboardEvent(env, {
+        type: "audit", scope: "login", action: "account_mismatch",
+        device_id: device.device_id.trim(), account_id: device.account_id.trim(),
+        status: "rejected", channel: "relay",
+      });
+      return jsonResponse(403, { error: "account or login code is invalid or no longer usable" });
+    }
+    boundAccountID = consumed.account_id;
+  } else {
+    return jsonResponse(400, { error: "account password is required" });
   }
 
   const record = {
     device_id: device.device_id.trim(),
     secret_hash: secretHash,
-    account_id: consumed.account_id,
+    account_id: boundAccountID,
     approval_status: "approved",
     device_kind: "android_agent",
     device_name: stringValue(device.device_name).slice(0, 120),
@@ -2363,6 +2411,7 @@ async function handleDashboardAccountAPI(request, env, url) {
     }
     if (request.method === "POST" && path === "/dashboard/api/invitations") {
       const value = await readJSON(request);
+      // account_id 可省略：签发「开放邀请码」，持码者在客户端自设账号 ID+密码建号。
       const result = await createInvitation(env, {
         accountID: value.account_id, ttlHours: value.ttl_hours, purpose: value.purpose,
       });

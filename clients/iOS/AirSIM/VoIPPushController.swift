@@ -758,6 +758,10 @@ struct AgentPushRegistration: Encodable, Equatable, Sendable {
     var notificationForwarding: NotificationForwardingConfig? = nil
     // 账号层：一次性邀请码。仅首次注册需要；成功消费后由调用方清除。
     var invitationCode: String? = nil
+    // 账号层自助注册：持开放邀请码建号（账号 ID + 密码由用户自设）。
+    var createAccount: Bool? = nil
+    var selfRegisterAccountID: String? = nil
+    var accountPassword: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case cloudModeEnabled = "cloud_enabled"
@@ -779,6 +783,9 @@ struct AgentPushRegistration: Encodable, Equatable, Sendable {
         case vowlanSecret = "vowlan_secret"
         case notificationForwarding = "notification_forwarding"
         case invitationCode = "invitation_code"
+        case createAccount = "create_account"
+        case selfRegisterAccountID = "account_id"
+        case accountPassword = "account_password"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -788,6 +795,9 @@ struct AgentPushRegistration: Encodable, Equatable, Sendable {
         try values.encodeIfPresent(vowlanSecret, forKey: .vowlanSecret)
         try values.encodeIfPresent(notificationForwarding, forKey: .notificationForwarding)
         try values.encodeIfPresent(invitationCode, forKey: .invitationCode)
+        try values.encodeIfPresent(createAccount, forKey: .createAccount)
+        try values.encodeIfPresent(selfRegisterAccountID, forKey: .selfRegisterAccountID)
+        try values.encodeIfPresent(accountPassword, forKey: .accountPassword)
         guard !localMode else { return }
 
         try values.encode(deviceID, forKey: .deviceID)
@@ -1817,12 +1827,15 @@ final class VoIPPushController: NSObject {
         relayRegistration.notificationForwarding = nil
         request.httpBody = try JSONEncoder().encode(relayRegistration)
         let (data, response) = try await RelayEgressGate.shared.send(request)
-#if DEBUG
+        let defaults = UserDefaults.standard
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             let detail = String(data: data.prefix(1_024), encoding: .utf8) ?? "<非文本响应>"
             print("[AirSIM PushKit] Relay 注册被拒绝；HTTP=\(http.statusCode) body=\(detail)")
+            // 账号层：把拒绝原因透给登录页展示（如账号已存在、密码不合规范）。
+            let body = try? JSONDecoder().decode([String: String].self, from: data)
+            defaults.set("HTTP \(http.statusCode)：\(body?["error"] ?? "注册被拒绝")",
+                         forKey: AccountKeys.lastRegistrationError)
         }
-#endif
         guard let http = response as? HTTPURLResponse else {
             throw CloudAgentStatusError.invalidResponse
         }
@@ -1842,13 +1855,16 @@ final class VoIPPushController: NSObject {
         guard let result = try? JSONDecoder().decode(ResponseBody.self, from: data),
               result.registered else { throw CloudAgentStatusError.invalidResponse }
         // 账号层：记录审批状态。pending 设备在服务器上只能完成受限注册与状态查询。
-        let defaults = UserDefaults.standard
         if let status = result.approvalStatus {
             defaults.set(status, forKey: AccountKeys.approvalStatus)
         }
-        if result.approvalStatus == "approved", let code = defaults.string(forKey: AccountKeys.invitationCode) {
+        if result.approvalStatus == "approved" {
+            defaults.removeObject(forKey: AccountKeys.lastRegistrationError)
             // 邀请码已一次性消费，立即清除，不留在本地存储。
             defaults.removeObject(forKey: AccountKeys.invitationCode)
+            // 自助注册凭据（账号 ID/密码）同样只在注册瞬间需要。
+            defaults.removeObject(forKey: AccountKeys.selfRegisterAccountID)
+            defaults.removeObject(forKey: AccountKeys.selfRegisterPassword)
         }
     }
 
@@ -1928,6 +1944,11 @@ final class VoIPPushController: NSObject {
         defaults.set(deviceID, forKey: Keys.deviceID)
         let relayURL = configuredRelayURL()
         let capabilities = CloudModeCapabilities(isEnabled: CloudModePreference.isEnabled())
+        let invitation = defaults.string(forKey: AccountKeys.invitationCode)
+        let selfRegisterID = defaults.string(forKey: AccountKeys.selfRegisterAccountID)
+        let selfRegisterPassword = defaults.string(forKey: AccountKeys.selfRegisterPassword)
+        // 自助注册模式：邀请码 + 自设账号 ID/密码 一并提交（开放邀请码换取建号资格）。
+        let useSelfRegister = !(selfRegisterID ?? "").isEmpty && !(selfRegisterPassword ?? "").isEmpty
         return AgentPushRegistration(
             cloudModeEnabled: capabilities.notificationRelay,
             localMode: false,
@@ -1949,7 +1970,10 @@ final class VoIPPushController: NSObject {
             forceLegacyPCM: CloudMediaTransportPreference.forceLegacy(),
             vowlanSecret: nil,
             notificationForwarding: NotificationForwardingStore.load(),
-            invitationCode: defaults.string(forKey: AccountKeys.invitationCode)
+            invitationCode: invitation,
+            createAccount: useSelfRegister ? true : nil,
+            selfRegisterAccountID: useSelfRegister ? selfRegisterID : nil,
+            accountPassword: useSelfRegister ? selfRegisterPassword : nil
         )
     }
 

@@ -354,3 +354,72 @@ test("revoked login code blocks new agent sign-ins; account list requires approv
   }), pendingEnv);
   assert.equal(pendingList.status, 403);
 });
+
+test("open invitation + account password: iOS creates account, Android signs in with password", async () => {
+  const env = baseEnv({ ACCOUNT_MODE: "enforced" });
+
+  // Server (dashboard) issues an OPEN invitation — no pre-bound account.
+  const mint = await handleRequest(jsonRequest("POST", "/dashboard/api/invitations",
+    { purpose: "self-register" }, DASHBOARD_AUTH), env);
+  assert.equal(mint.status, 200);
+  const openInvite = await mint.clone().json();
+  assert.equal(openInvite.account_id, null);
+
+  // iOS controller: invitation + chosen account id + password -> approved.
+  const reg = await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    registrationBody({
+      invitation_code: openInvite.code,
+      create_account: true,
+      account_id: "family",
+      account_password: "s3cure-Pass!",
+    })), env);
+  assert.equal(reg.status, 200);
+  assert.equal((await reg.clone().json()).approval_status, "approved");
+
+  // The same invitation cannot create a second account.
+  const reg2 = await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    registrationBody({ device_id: "f".repeat(32),
+      invitation_code: openInvite.code,
+      create_account: true, account_id: "other", account_password: "s3cure-Pass!" }),
+    {}, "203.0.113.20"), env);
+  assert.equal(reg2.status, 403);
+
+  // Android agent signs in with account id + password (no pairing, no code).
+  const agent = await handleRequest(jsonRequest("POST", "/v1/agent/login",
+    agentLoginBody({ account_id: "family", login_code: "", account_password: "s3cure-Pass!" })), env);
+  assert.equal(agent.status, 200);
+  const agentPayload = await agent.clone().json();
+  assert.equal(agentPayload.approval_status, "approved");
+
+  // Wrong password is rejected uniformly.
+  const bad = await handleRequest(jsonRequest("POST", "/v1/agent/login",
+    agentLoginBody({ account_id: "family", device_id: "9".repeat(32), device_secret: "w".repeat(32),
+      login_code: "", account_password: "wrong-wrong" }), {}, "203.0.113.21"), env);
+  assert.equal(bad.status, 403);
+
+  // Android devices may never create accounts.
+  const androidCreate = await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    agentLoginBody({ login_code: "", account_password: "s3cure-Pass!" }),
+    { invitation_code: "whatever" }), env);
+  assert.notEqual(androidCreate.status, 500);
+
+  // Account device list shows both devices.
+  const list = await handleRequest(jsonRequest("GET", "/v1/account/devices", null, {
+    "x-airsim-device-id": "a".repeat(32),
+    authorization: `Bearer ${"s".repeat(32)}`,
+  }), env);
+  const payload = await list.json();
+  assert.equal(payload.account_id, "family");
+  assert.equal(payload.devices.length, 2);
+
+  // Short passwords are rejected at the policy layer.
+  const mint2 = await handleRequest(jsonRequest("POST", "/dashboard/api/invitations",
+    { purpose: "self-register" }, DASHBOARD_AUTH), env);
+  const open2 = await mint2.json();
+  const short = await handleRequest(jsonRequest("POST", "/v1/devices/register",
+    registrationBody({
+      device_id: "e".repeat(32), device_secret: "x".repeat(32),
+      invitation_code: open2.code, create_account: true,
+      account_id: "family2", account_password: "short" })), env);
+  assert.equal(short.status, 400);
+});

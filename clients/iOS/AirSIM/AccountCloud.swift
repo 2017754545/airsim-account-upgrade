@@ -11,6 +11,9 @@ enum AccountKeys {
     static let invitationCode = "airsim.account.invitation-code"
     static let approvalStatus = "airsim.account.approval-status"
     static let loginCode = "airsim.account.login-code"
+    static let selfRegisterAccountID = "airsim.account.self-register-account-id"
+    static let selfRegisterPassword = "airsim.account.self-register-password"
+    static let lastRegistrationError = "airsim.account.last-registration-error"
 }
 
 enum AccountCloudError: LocalizedError {
@@ -152,6 +155,10 @@ struct AccountLoginView: View {
     let onEnterApp: () -> Void
 
     @State private var invitationCode = UserDefaults.standard.string(forKey: AccountKeys.invitationCode) ?? ""
+    @State private var registrationStep = 1
+    @State private var accountID = ""
+    @State private var accountPassword = ""
+    @State private var confirmPassword = ""
     @State private var loginBusy = false
     @State private var message = ""
     @State private var devices: [AccountDevice] = []
@@ -234,31 +241,68 @@ struct AccountLoginView: View {
 
     private var loginSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("邀请码")
-                .font(.footnote)
-                .foregroundColor(.secondary)
-            TextField("邀请码（如 ASR-XXXX-XXXX-XXXX）", text: $invitationCode)
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.characters)
-                .autocorrectionDisabled()
-                .accessibilityIdentifier("account.invitationCode")
-            Button {
-                login()
-            } label: {
-                Text(loginBusy ? "正在登录…" : "登录 / 绑定账号")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+            if registrationStep == 1 {
+                // 第一步：服务器签发的邀请码（换取建号资格）
+                Text("邀请码")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                TextField("邀请码（如 ASR-XXXX-XXXX-XXXX）", text: $invitationCode)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("account.invitationCode")
+                Button {
+                    message = ""
+                    registrationStep = 2
+                } label: {
+                    Text("下一步").frame(maxWidth: .infinity).padding(.vertical, 6)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(invitationCode.trimmingCharacters(in: .whitespaces).isEmpty)
+                Text("邀请码由管理员在服务器生成，一次性有效；输入后即可设置你的账号 ID 与密码。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                // 第二步：自设账号 ID + 密码（建号并绑定此设备）
+                Text("设置账号")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                TextField("账号 ID（字母或数字，如 family）", text: $accountID)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("account.accountID")
+                SecureField("密码（至少 8 位）", text: $accountPassword)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("account.password")
+                SecureField("确认密码", text: $confirmPassword)
+                    .textFieldStyle(.roundedBorder)
+                HStack(spacing: 10) {
+                    Button {
+                        registrationStep = 1
+                        message = ""
+                    } label: {
+                        Text("上一步").frame(maxWidth: .infinity).padding(.vertical, 6)
+                    }
+                    .buttonStyle(.bordered)
+                    Button {
+                        registerAndBind()
+                    } label: {
+                        Text(loginBusy ? "正在注册…" : "注册并绑定")
+                            .frame(maxWidth: .infinity).padding(.vertical, 6)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(loginBusy || accountID.trimmingCharacters(in: .whitespaces).isEmpty
+                              || accountPassword.isEmpty || accountPassword != confirmPassword)
+                }
+                Text("账号 ID 与密码同时用于 Android 被控端登录；密码仅用于登录验证。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(loginBusy || invitationCode.trimmingCharacters(in: .whitespaces).isEmpty)
-            Text("邀请码由管理员在 Dashboard 生成，一次性有效；"
-                 + "注册成功后此设备即绑定账号。")
-                .font(.caption)
-                .foregroundColor(.secondary)
             if !message.isEmpty {
                 Text(message)
                     .font(.footnote)
-                    .foregroundColor(.blue)
+                    .foregroundColor(message.contains("成功") ? .green : .blue)
             }
         }
     }
@@ -310,7 +354,7 @@ struct AccountLoginView: View {
                 .background(Color(uiColor: .secondarySystemBackground))
                 .cornerRadius(12)
             } else {
-                Text("在 Android 端打开 App，输入此账号 ID 与登录码即可免配对加入账号。")
+                Text("Android 被控端打开 App，输入账号 ID「\(accountIDForDisplay())」和注册时设置的密码即可登录加入账号（免配对）。")
                     .font(.footnote).foregroundColor(.secondary)
             }
             Button {
@@ -362,6 +406,48 @@ struct AccountLoginView: View {
                 message = "邀请码无效或已过期，请向管理员索取新的邀请码。"
             }
         }
+    }
+
+    /// 两步注册的第二步：邀请码 + 自设账号 ID/密码 建号并绑定。
+    private func registerAndBind() {
+        let trimmedInvite = invitationCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let trimmedID = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmedInvite.isEmpty, !trimmedID.isEmpty else { return }
+        guard accountPassword == confirmPassword, accountPassword.count >= 8 else {
+            message = "两次输入的密码不一致或不足 8 位。"
+            return
+        }
+        loginBusy = true
+        message = ""
+        let defaults = UserDefaults.standard
+        defaults.set(trimmedInvite, forKey: AccountKeys.invitationCode)
+        defaults.set(trimmedID, forKey: AccountKeys.selfRegisterAccountID)
+        defaults.set(accountPassword, forKey: AccountKeys.selfRegisterPassword)
+        defaults.removeObject(forKey: AccountKeys.approvalStatus)
+        defaults.removeObject(forKey: AccountKeys.lastRegistrationError)
+        Task { @MainActor in
+            await VoIPPushController.shared.syncRegistration()
+            loginBusy = false
+            if AccountCloud.isAccountApproved {
+                message = "注册成功：账号 \(trimmedID) 已创建并绑定。"
+                UserDefaults.standard.set(true, forKey: "airsim.first-connection-complete")
+                await refreshDevices()
+            } else if let error = defaults.string(forKey: AccountKeys.lastRegistrationError) {
+                message = error
+                // 账号已存在等情况：回到第一步重新输入邀请码。
+                if error.contains("409") || error.contains("already exists") {
+                    registrationStep = 1
+                }
+            } else if defaults.string(forKey: AccountKeys.approvalStatus) == "pending" {
+                message = "注册已提交：等待管理员批准。"
+            } else {
+                message = "注册未完成，请检查网络后重试。"
+            }
+        }
+    }
+
+    private func accountIDForDisplay() -> String {
+        UserDefaults.standard.string(forKey: AccountKeys.selfRegisterAccountID) ?? "（注册时设置的账号 ID）"
     }
 
     private func mintLoginCode() {

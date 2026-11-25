@@ -28,21 +28,22 @@ enum SystemCommunicationURL {
 }
 
 enum PhoneTab: String, CaseIterable, Identifiable {
-    case dial = "拨号"
+    // 参考视频的五个主页面：设备 / 通话 / 最近通话 / 短信 / 账号。
+    case devices = "设备"
+    case dial = "通话"
     case recents = "最近通话"
     case messages = "短信"
-    case contacts = "通讯录"
-    case settings = "设置"
+    case account = "账号"
 
     var id: String { rawValue }
 
     var icon: String {
         switch self {
+        case .devices: return "iphone.gen3"
         case .dial: return "phone"
         case .recents: return "clock"
         case .messages: return "bubble.left.and.bubble.right"
-        case .contacts: return "person.crop.rectangle"
-        case .settings: return "slider.horizontal.3"
+        case .account: return "person.crop.circle"
         }
     }
 
@@ -59,7 +60,8 @@ enum PhoneTab: String, CaseIterable, Identifiable {
     var tabTitle: String {
         switch self {
         case .recents: return "最近"
-        case .contacts: return "联系人"
+        case .devices: return "设备"
+        case .account: return "账号"
         default: return rawValue
         }
     }
@@ -77,7 +79,7 @@ struct RootView: View {
     @State private var appUpdatePresentation: AppUpdatePresentation?
     // 账号层：未绑定账号时先展示 AirSIM Cloud 登录页（邀请码登录）。
     @State private var accountGateVisible = !AccountCloud.isAccountApproved
-    @AppStorage("airsim.selected-tab") private var selectedTabRawValue = PhoneTab.dial.rawValue
+    @AppStorage("airsim.selected-tab") private var selectedTabRawValue = PhoneTab.devices.rawValue
     @State private var callbackSIMRequest: CallbackSIMDialRequest?
     @State private var pendingSMSRecipient: String?
     @State private var messageListState = SMSConversationListState()
@@ -96,6 +98,12 @@ struct RootView: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
                 TabView(selection: selectedTabBinding) {
+                    DevicesTabView(onCall: dial)
+                        .tag(PhoneTab.devices)
+                        .tabItem { Label { Text(L10n.t(PhoneTab.devices.tabTitle)) } icon: {
+                            Image(uiImage: PhoneTab.devices.tabImage)
+                        }.environment(\.symbolVariants, .none) }
+
                     DialPadView()
                         .tag(PhoneTab.dial)
                         .tabItem { Label { Text(L10n.t(PhoneTab.dial.tabTitle)) } icon: {
@@ -144,17 +152,10 @@ struct RootView: View {
 
                         .badge(AirSIMWidgetSnapshot.badgeText(model.unreadMessageIDs.count))
 
-                    ContactsView(onCall: dial, onMessage: composeMessage)
-                        .tag(PhoneTab.contacts)
-                        .tabItem { Label { Text(L10n.t(PhoneTab.contacts.tabTitle)) } icon: {
-                            Image(uiImage: PhoneTab.contacts.tabImage)
-                        }.environment(\.symbolVariants, .none) }
-
-
-                    AirSIMSettingsView()
-                        .tag(PhoneTab.settings)
-                        .tabItem { Label { Text(L10n.t(PhoneTab.settings.tabTitle)) } icon: {
-                            Image(uiImage: PhoneTab.settings.tabImage)
+                    AccountTabView()
+                        .tag(PhoneTab.account)
+                        .tabItem { Label { Text(L10n.t(PhoneTab.account.tabTitle)) } icon: {
+                            Image(uiImage: PhoneTab.account.tabImage)
                         }.environment(\.symbolVariants, .none) }
 
                 }
@@ -200,6 +201,10 @@ struct RootView: View {
                 AccountLoginView(onEnterApp: { accountGateVisible = false })
                     .transition(.opacity)
             }
+        }
+        // 退出登录（账号 Tab）后重新弹出一页式登录 gate。
+        .onReceive(NotificationCenter.default.publisher(for: .airsimAccountLoggedOut)) { _ in
+            accountGateVisible = true
         }
         .sheet(item: $model.focusedOtherDeviceCall, onDismiss: presentAppUpdateIfIdle) { reminder in
             OtherDeviceCallSheet(reminder: reminder).environmentObject(model)

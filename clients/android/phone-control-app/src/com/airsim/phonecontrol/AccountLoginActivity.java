@@ -26,9 +26,9 @@ import java.security.SecureRandom;
 /**
  * 账号登录入口（被控端）。
  *
- * Android 不开放注册：iOS 控制端用邀请码注册账号后生成「账号登录码」，
- * 被控端在此输入 账号 ID + 登录码 即可直接加入账号（免配对、自动同步）。
- * 同一账号可登录多台 Android 设备；登录码可由 iOS 端吊销。
+ * Android 不开放注册：iOS 控制端持服务器邀请码注册账号（自设账号 ID + 密码），
+ * 被控端在此输入 账号 ID + 密码 即可直接登录加入账号（免配对、自动同步）。
+ * 同一账号可登录多台 Android 设备。
  */
 public final class AccountLoginActivity extends Activity {
 
@@ -79,7 +79,7 @@ public final class AccountLoginActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("账号登录 · 无需配对\n输入 iOS 端生成的账号登录码，直接加入账号并自动同步");
+        subtitle.setText("账号登录 · 无需配对\n输入 iOS 端注册时设置的账号 ID 与密码，直接加入账号并自动同步");
         subtitle.setTextSize(14);
         subtitle.setTextColor(0xFF8FA0B3);
         subtitle.setPadding(0, dp(10), 0, dp(20));
@@ -104,12 +104,10 @@ public final class AccountLoginActivity extends Activity {
         accountInput.setHint("例如 myname");
         root.addView(accountInput);
 
-        root.addView(fieldLabel("账号登录码（iOS 端 → 设置 → 生成安卓登录码）"));
+        root.addView(fieldLabel("密码（iOS 端注册账号时设置）"));
         codeInput = lineInput(card);
-        codeInput.setHint("8 位登录码");
-        codeInput.setTextSize(18);
-        codeInput.setTypeface(Typeface.MONOSPACE);
-        codeInput.setLetterSpacing(0.15f);
+        codeInput.setHint("账号密码");
+        codeInput.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
         root.addView(codeInput);
 
         loginButton = filledButton("登录并绑定此设备", accent, 0xFF10514A);
@@ -119,7 +117,7 @@ public final class AccountLoginActivity extends Activity {
         TextView footnote = new TextView(this);
         footnote.setText("登录后设备立即加入账号：iPhone 端会自动出现此设备，"
                 + "通话与短信经 Relay 云端通道同步，无需同一局域网。"
-                + "登录码一次性可多台设备使用，可在 iOS 端随时吊销。");
+                + "同一账号可登录多台安卓设备，全部自动出现在 iPhone 的账号设备列表中。");
         footnote.setTextSize(12);
         footnote.setTextColor(0xFF6B7A8C);
         footnote.setPadding(0, dp(24), 0, 0);
@@ -153,9 +151,9 @@ public final class AccountLoginActivity extends Activity {
     private void submitLogin() {
         if (loginInFlight) return;
         String accountID = accountInput.getText().toString().trim();
-        String loginCode = codeInput.getText().toString().trim().toUpperCase(java.util.Locale.ROOT);
-        if (accountID.isEmpty() || loginCode.isEmpty()) {
-            toast("请输入账号 ID 和登录码");
+        String password = codeInput.getText().toString();
+        if (accountID.isEmpty() || password.isEmpty()) {
+            toast("请输入账号 ID 和密码");
             return;
         }
         loginInFlight = true;
@@ -164,7 +162,7 @@ public final class AccountLoginActivity extends Activity {
         statusView.setText("● 正在向 Relay 提交登录…");
         // 网络请求放到后台线程；UI 结果回到主线程。
         new Thread(() -> {
-            String error = performLogin(accountID, loginCode);
+            String error = performLogin(accountID, password);
             runOnUiThread(() -> {
                 loginInFlight = false;
                 loginButton.setEnabled(true);
@@ -182,7 +180,7 @@ public final class AccountLoginActivity extends Activity {
     }
 
     /** 后台线程执行；返回 null 表示成功。 */
-    private String performLogin(String accountID, String loginCode) {
+    private String performLogin(String accountID, String password) {
         try {
             JSONObject registration = new JSONObject()
                     .put("relay_url", RelayURLPolicy.forInstall(RelayURLPolicy.INSTALL_RELAY_URL))
@@ -193,7 +191,7 @@ public final class AccountLoginActivity extends Activity {
                     .put("device_name", deviceName())
                     .put("model", Build.MODEL == null ? "" : Build.MODEL)
                     .put("account_id", accountID)
-                    .put("login_code", loginCode)
+                    .put("account_password", password)
                     .put("local_mode", false)
                     .put("cloud_enabled", true);
             JSONObject payload = new JSONObject()
@@ -204,7 +202,7 @@ public final class AccountLoginActivity extends Activity {
                     .put("device_name", registration.getString("device_name"))
                     .put("model", registration.getString("model"))
                     .put("account_id", accountID)
-                    .put("login_code", loginCode);
+                    .put("account_password", password);
             StandaloneRelayClient.Response response = new StandaloneRelayClient()
                     .post(registration, "/v1/agent/login", payload, 15_000);
             if (response.status() == 200) {

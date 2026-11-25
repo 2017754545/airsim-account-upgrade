@@ -609,11 +609,6 @@ struct AirSIMSettingsView: View {
     @AppStorage(FeedbackUploader.remarkKey) private var feedbackRemark = ""
     @State private var feedbackUploadStatus = ""
     @State private var feedbackUploading = false
-    @State private var relayURL = RelayConfiguration.effectiveURL(
-        stored: UserDefaults.standard.string(forKey: "airsim.push-relay-url"),
-        buildSetting: Bundle.main.object(forInfoDictionaryKey: "AirSIMPushRelayURL") as? String,
-        bundleID: Bundle.main.bundleIdentifier
-    )
     @State private var message: String?
     @State private var selfTestPhase: SelfTestPhase = .idle
     @State private var selfTestReport: CloudSelfTestReport?
@@ -643,9 +638,6 @@ struct AirSIMSettingsView: View {
     @State private var localCheckDate: Date?
     @State private var localCheckStatus: String?
     @State private var notificationPermission = "正在读取"
-    @State private var relaySaving = false
-    @State private var invitationCode = UserDefaults.standard.string(forKey: AccountKeys.invitationCode) ?? ""
-    @State private var invitationSaving = false
     @State private var selfTestCopied = false
 
     var body: some View {
@@ -1047,26 +1039,17 @@ struct AirSIMSettingsView: View {
         Group {
             Section {
                 LabeledContent("云端通话", value: pureLocalEnabled ? "纯本地已阻止" : runtimePolicy.startsCloud ? "当前模式启用" : "当前未使用")
-                TextField("https://relay.example.com", text: $relayURL)
-                    .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    .accessibilityIdentifier("settings.relayURL")
-                Button(relaySaving ? "正在保存…" : "保存 Relay 地址") { saveRelay() }
-                    .disabled(pureLocalEnabled || updateCallBusy || relaySaving)
-                TextField("邀请码（首次注册需要，如 ASR-XXXX-XXXX-XXXX）", text: $invitationCode)
-                    .textInputAutocapitalization(.characters).autocorrectionDisabled()
-                    .accessibilityIdentifier("settings.invitationCode")
-                Button(invitationSaving ? "正在提交…" : "使用邀请码重新注册") { saveInvitation() }
-                    .disabled(pureLocalEnabled || updateCallBusy || invitationSaving)
                 let approvalStatus = UserDefaults.standard.string(forKey: AccountKeys.approvalStatus)
                 if let approvalStatus {
-                    Text(approvalStatus == "approved" ? "设备已绑定账号，无需再填邀请码。"
-                        : approvalStatus == "pending" ? "设备待管理员批准；批准后无需再填邀请码。"
-                        : "设备已被撤销；请向管理员申请新邀请码。")
+                    Text(approvalStatus == "approved" ? "设备已绑定账号。"
+                        : approvalStatus == "pending" ? "设备待管理员批准。"
+                        : "设备已被撤销；请退出登录后重新注册。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 if let message { Text(message).font(.footnote).foregroundStyle(.secondary) }
             } footer: {
-                Text(pureLocalEnabled ? "纯本地模式已阻止 Relay，请先关闭纯本地模式。" : "保存地址与设备注册是不同步骤。当前未使用云端通话，也可手动自检。")
+                // 账号化后服务器地址来自构建配置，不再提供手动编辑入口。
+                Text("Relay 地址由应用内置配置提供；账号绑定在「设备」与登录页完成。")
             }
             cloudAudioBufferSection
             Section { link(.cloudCheck, "stethoscope") }
@@ -1136,52 +1119,6 @@ struct AirSIMSettingsView: View {
             await model.vowlan.probeNow()
             localCheckDate = Date()
             localCheckStatus = VoWLANStatusCopy.text(for: model.vowlan.availability)
-        }
-    }
-
-    private func saveInvitation() {
-        guard !invitationSaving else { return }
-        let trimmed = invitationCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        let defaults = UserDefaults.standard
-        guard !trimmed.isEmpty else {
-            // 清空即清除本地邀请码。
-            defaults.removeObject(forKey: AccountKeys.invitationCode)
-            message = "已清除本地邀请码。"
-            return
-        }
-        invitationSaving = true
-        defer { invitationSaving = false }
-        defaults.set(trimmed, forKey: AccountKeys.invitationCode)
-        defaults.removeObject(forKey: AccountKeys.approvalStatus)
-        message = "邀请码已保存；正在重新注册设备。"
-        Task { @MainActor in
-            await VoIPPushController.shared.syncRegistration()
-            if let status = UserDefaults.standard.string(forKey: AccountKeys.approvalStatus) {
-                message = status == "approved" ? "注册成功：设备已绑定账号。"
-                    : status == "pending" ? "注册已提交：等待管理员批准。"
-                    : "注册已提交：当前状态 \(status)。"
-            }
-        }
-    }
-
-    private func saveRelay() {
-        guard !pureLocalEnabled, !updateCallBusy, !relaySaving else { return }
-        guard let value = AirSIMSettingsPolicy.validRelayURL(relayURL) else {
-            message = "请输入完整的 http:// 或 https:// 地址，不包含账号、密码、查询参数或片段。"
-            return
-        }
-        relaySaving = true
-        VoIPPushController.shared.updateRelayURL(value)
-        relayURL = VoIPPushController.shared.configuredRelayURL()
-        selfTestTask?.cancel(); selfTestReport = nil; selfTestPhase = .idle
-        diagnosticCloudOnline = nil
-        message = "地址已保存；设备注册状态请运行自检确认。"
-        Task { @MainActor in
-            defer { relaySaving = false }
-            if let (api, _) = await model.readyVoWLANRoute() {
-                await VoIPPushController.shared.syncRegistration(with: api)
-            }
-            if !pureLocalEnabled { await model.refreshCloudStatusForDiagnostics() }
         }
     }
 
