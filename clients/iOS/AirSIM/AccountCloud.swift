@@ -71,7 +71,7 @@ enum AccountCloud {
 
     /// 账号设备（含同账号的安卓被控端）。返回 nil 表示本设备尚未绑定账号。
     static func listDevices() async -> [AccountDevice]? {
-        guard let credentials = VoIPPushController.shared.cloudCallControlCredentials() else {
+        guard let credentials = await VoIPPushController.shared.cloudCallControlCredentials() else {
             return nil
         }
         guard let url = RelayEndpoint.url(
@@ -99,7 +99,7 @@ enum AccountCloud {
 
     /// 生成本账号的安卓登录码。明文只出现一次，需立即展示给用户。
     static func createLoginCode() async throws -> AccountLoginCode {
-        guard let credentials = VoIPPushController.shared.cloudCallControlCredentials() else {
+        guard let credentials = await VoIPPushController.shared.cloudCallControlCredentials() else {
             throw AccountCloudError.invalidRelay
         }
         guard let url = RelayEndpoint.url(
